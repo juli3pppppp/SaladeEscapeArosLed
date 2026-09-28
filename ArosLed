@@ -1,0 +1,680 @@
+/*
+  Simulador de tarea "Cableado" de Among Us: 3 MODULOS en SECUENCIA,
+  con sensor HC-SR04, buzzer y protocolo de sala por MQTT (multi-tablero).
+
+	Modulos del codigo
+
+    1. MODULO CONFIG           -> pines, colores, credenciales, constantes
+    2. MODULO RING (NeoPixel)  -> dibuja los 3 anillos, no sabe nada mas
+    3. MODULO BOTONES          -> lectura con anti-rebote de los 3 botones
+    4. MODULO SENSOR (HC-SR04) -> mide distancia y detecta presencia
+    5. MODULO BUZZER           -> sonidos de fallo y de victoria
+    6. MODULO MQTT             -> WiFi + conexion/reconexion/publish MQTT
+    7. MODULO JUEGO            -> las REGLAS: usa a todos los anteriores
+                                   como "servicios" para armar la logica
+    8. setup() / loop()        -> solo inicializa y delega en el juego
+
+
+  ============================================================================
+
+  Librerias requeridas (Arduino IDE / PlatformIO lib_deps):
+    "Adafruit NeoPixel"
+    "PubSubClient" (knolleary)
+
+  Conexiones:
+    Modulo 1: anillo DIN -> GPIO 13  | boton -> GPIO 26
+    Modulo 2: anillo DIN -> GPIO 12  | boton -> GPIO 27
+    Modulo 3: anillo DIN -> GPIO 14  | boton -> GPIO 5
+    HC-SR04:  TRIG -> GPIO 33 | ECHO -> GPIO 25 (con divisor 5V->3.3V)
+    Buzzer pasivo: pata + -> GPIO 18 | pata - -> GND
+*/
+
+#include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+
+/* ============================================================================
+   1. MODULO CONFIG
+   Toda la configuracion del proyecto: pines, colores,
+   velocidades, credenciales WiFi/MQTT y numero de tablero.
+   ============================================================================ */
+
+// ---------- Configuracion general ----------
+#define NUM_MODULOS   3
+#define NUM_LEDS      24     // LEDs por anillo
+
+#define DEBOUNCE_MS        200
+#define SUCCESS_BLINK_MS   150
+#define FAIL_BLINK_MS      150
+
+// ---------- Sensor ultrasonico HC-SR04 (compartido) ----------
+#define TRIG_PIN                 33
+#define ECHO_PIN                 25
+#define DISTANCE_THRESHOLD_CM    15
+#define SENSOR_READ_INTERVAL_MS  100
+#define SENSOR_TIMEOUT_US        25000UL
+
+// ---------- Buzzer pasivo ----------
+#define BUZZER_PIN   18
+
+// ---------- Pines y parametros por modulo (anillo) ----------
+const uint8_t LED_PINS[NUM_MODULOS]    = { 13, 12, 14 };
+const uint8_t BUTTON_PINS[NUM_MODULOS] = { 26, 27, 5 };
+const uint8_t TARGET_LED[NUM_MODULOS]  = { 12, 12, 13 };         
+const uint16_t ROTATE_DELAY_MS[NUM_MODULOS] = { 100, 70, 50 };   // rapido, medio, lento
+
+const uint8_t MAIN_COLOR_RGB[NUM_MODULOS][3] = {
+  {   0,   0, 139 },  // Modulo 1: azul oscuro
+  { 255,  69,   0 },  // Modulo 2: naranja rojizo
+  {   0, 255,   0 },  // Modulo 3: verde
+};
+const uint8_t CURSOR_COLOR_RGB[NUM_MODULOS][3] = {
+  { 255, 140,   0 },  // Modulo 1: naranja
+  { 102, 205, 170 },  // Modulo 2: verde agua
+  { 200,   0, 255 },  // Modulo 3: violeta
+};
+
+// Que tan atenuado se ve el color de fondo mientras gira el cursor
+#define MAIN_DIM_FACTOR 0.35f
+
+// ---------- WiFi ----------
+const char* WIFI_SSID     = "TU_RED_WIFI";       
+const char* WIFI_PASSWORD = "TU_PASSWORD_WIFI"; 
+// ---------- MQTT ----------
+const char* MQTT_BROKER    = "broker.emqx.io";   // broker publico de EMQX (pruebas con MQTTX)
+const int   MQTT_PORT      = 1883;
+const char* MQTT_CLIENT_ID = "esp32_among_us";
+const char* MQTT_TOPIC_WIN = "amongus/tablero1/ganado";
+#define TOPIC_CONTROL_SALA "sala/control"
+
+// ---------- Protocolo de sala (varios tableros en secuencia) ----------
+const uint8_t NUMERO_TABLERO = 1;  
+
+/* ============================================================================
+   2. MODULO RING (NeoPixel)
+   Encargado EXCLUSIVAMENTE de dibujar en los 3 anillos. No sabe nada de
+   botones, sensores ni MQTT: solo recibe y lo hace.
+   ============================================================================ */
+
+Adafruit_NeoPixel ring0(NUM_LEDS, LED_PINS[0], NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel ring1(NUM_LEDS, LED_PINS[1], NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel ring2(NUM_LEDS, LED_PINS[2], NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel* rings[NUM_MODULOS] = { &ring0, &ring1, &ring2 };
+
+uint32_t colorMain[NUM_MODULOS];
+uint32_t colorMainDim[NUM_MODULOS];
+uint32_t colorCursor[NUM_MODULOS];
+uint32_t COLOR_EXITO;
+uint32_t COLOR_ERROR;
+
+void ringsInit();
+void paintSpinningFrame(int modulo, int cursorPos);
+void paintStaticFrame(int modulo);
+void paintSuccessBlinkStep(int modulo, int ledIndex, bool encendido);
+void paintFailBlinkStep(int modulo, int ledIndex, bool encendido);
+void celebrateAllModules();
+
+
+/* ============================================================================
+   3. MODULO BOTONES
+   Lectura con anti-rebote de los 3 botones (uno por modulo).
+   ============================================================================ */
+
+unsigned long lastPressTime[NUM_MODULOS];
+bool lastButtonState[NUM_MODULOS];
+
+void buttonsInit();
+bool buttonWasPressed(int modulo);
+
+
+/* ============================================================================
+   4. MODULO SENSOR (HC-SR04)
+   Mide distancia y decide si hay presencia, cacheando la lectura para
+   no medir en cada vuelta de loop().
+   ============================================================================ */
+
+unsigned long lastSensorRead = 0;
+bool personPresentCached = false;
+
+void sensorInit();
+long readDistanceCM();
+bool sensorUpdateAndIsPresent();
+
+
+/* ============================================================================
+   5. MODULO BUZZER
+   Sonidos del buzzer pasivo: fallo y victoria.
+   ============================================================================ */
+
+void buzzerInit();
+void playFailSound();
+void playWinSound();
+
+
+/* ============================================================================
+   6. MODULO MQTT
+   Transporte MQTT generico: conecta WiFi, conecta al broker, reconecta
+   solo, publica. NO conoce la logica del juego: el MODULO JUEGO le
+   registra un handler (callback) para recibir los mensajes que le
+   interesan.
+   ============================================================================ */
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+typedef void (*MqttMessageHandler)(char* topic, byte* payload, unsigned int length);
+MqttMessageHandler mqttExternalHandler = nullptr;
+
+void setupWiFi();
+void mqttModuleInit(MqttMessageHandler handler);
+void mqttModuleLoop();
+bool mqttIsConnected();
+void mqttPublish(const char* topic, const char* payload, bool retained);
+void mqttInternalCallback(char* topic, byte* payload, unsigned int length);
+void reconnectMQTT();
+
+
+/* ============================================================================
+   7. MODULO JUEGO
+   Las REGLAS del juego: la maquina de estados de los 3 aros en secuencia
+   y el protocolo de sala (activacion/reset de este tablero por MQTT).
+   Es el UNICO modulo que conoce las reglas; usa a todos los anteriores
+   como servicios.
+   ============================================================================ */
+
+enum JuegoEstado {
+  JUEGO_ESPERA,     // nadie jugando, todo fijo
+  JUEGO_JUGANDO,    // hay un modulo activo girando
+  JUEGO_COMPLETO    // se acertaron los 3, en orden
+};
+
+JuegoEstado juego = JUEGO_ESPERA;
+int activeModule = 0;
+bool waitingForLeave = false;
+
+int cursorIndex[NUM_MODULOS];
+unsigned long lastStepTime[NUM_MODULOS];
+
+enum EstadoTablero {
+  TABLERO_ESPERA   = '0',  // aun no le tocó el turno
+  TABLERO_ACTIVO   = '1',  // le llego su turno por MQTT
+  TABLERO_RESUELTO = '2'   // ya resolvio sus 3 aros
+};
+
+EstadoTablero estadoTablero = TABLERO_ESPERA;
+unsigned long tiempoActivacionTablero = 0;
+char topicEstadoTablero[40];
+char topicTiempoTablero[40];
+
+void gameInit();
+void gameLoop();
+void startModule(int m);
+void resetAllModulesGame();
+void handleButtonPress(int m);
+void onSuccess(int m);
+void onFail(int m);
+void updatePresence(bool nowPresent);
+void publicarEstadoTablero();
+void resetTableroCompleto();
+void gameMqttCallback(char* topic, byte* payload, unsigned int length);
+
+
+/* ============================================================================
+   8. setup() / loop()
+   Solo inicializan y delegan todo en el MODULO JUEGO.
+   ============================================================================ */
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  randomSeed(analogRead(0));
+
+  gameInit();
+}
+
+void loop() {
+  gameLoop();
+}
+
+
+/* ============================================================================
+   IMPLEMENTACION: MODULO RING (NeoPixel)
+   ============================================================================ */
+
+void ringsInit() {
+  for (int m = 0; m < NUM_MODULOS; m++) {
+    rings[m]->begin();
+    rings[m]->setBrightness(50);
+
+    colorMain[m] = rings[m]->Color(MAIN_COLOR_RGB[m][0], MAIN_COLOR_RGB[m][1], MAIN_COLOR_RGB[m][2]);
+    colorMainDim[m] = rings[m]->Color(
+      (uint8_t)(MAIN_COLOR_RGB[m][0] * MAIN_DIM_FACTOR),
+      (uint8_t)(MAIN_COLOR_RGB[m][1] * MAIN_DIM_FACTOR),
+      (uint8_t)(MAIN_COLOR_RGB[m][2] * MAIN_DIM_FACTOR)
+    );
+    colorCursor[m] = rings[m]->Color(CURSOR_COLOR_RGB[m][0], CURSOR_COLOR_RGB[m][1], CURSOR_COLOR_RGB[m][2]);
+
+    paintStaticFrame(m);
+  }
+
+  COLOR_EXITO = ring0.Color(0, 255, 0);
+  COLOR_ERROR = ring0.Color(255, 0, 0);
+}
+
+void paintSpinningFrame(int m, int cursorPos) {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    rings[m]->setPixelColor(i, colorMainDim[m]);
+  }
+  rings[m]->setPixelColor(cursorPos, colorCursor[m]);
+  rings[m]->show();
+}
+
+void paintStaticFrame(int m) {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    rings[m]->setPixelColor(i, colorMain[m]);
+  }
+  rings[m]->show();
+}
+
+void paintSuccessBlinkStep(int m, int ledIndex, bool encendido) {
+  rings[m]->setPixelColor(ledIndex, encendido ? COLOR_EXITO : colorMain[m]);
+  rings[m]->show();
+}
+
+void paintFailBlinkStep(int m, int ledIndex, bool encendido) {
+  rings[m]->setPixelColor(ledIndex, encendido ? COLOR_ERROR : colorMain[m]);
+  rings[m]->show();
+}
+
+void celebrateAllModules() {
+  const int PARPADEOS = 6;
+  const int BLINK_MS  = 80;
+
+  for (int b = 0; b < PARPADEOS; b++) {
+    for (int m = 0; m < NUM_MODULOS; m++) {
+      rings[m]->clear();
+      rings[m]->show();
+    }
+    delay(BLINK_MS);
+
+    for (int m = 0; m < NUM_MODULOS; m++) {
+      paintStaticFrame(m);
+    }
+    delay(BLINK_MS);
+  }
+
+  for (int m = 0; m < NUM_MODULOS; m++) {
+    paintStaticFrame(m);
+  }
+}
+
+
+/* ============================================================================
+   IMPLEMENTACION: MODULO BOTONES
+   ============================================================================ */
+
+void buttonsInit() {
+  for (int m = 0; m < NUM_MODULOS; m++) {
+    pinMode(BUTTON_PINS[m], INPUT_PULLUP);
+    lastPressTime[m]   = 0;
+    lastButtonState[m] = HIGH;
+  }
+}
+
+bool buttonWasPressed(int m) {
+  unsigned long now = millis();
+  bool buttonState = digitalRead(BUTTON_PINS[m]);
+  bool pressed = false;
+
+  if (lastButtonState[m] == HIGH && buttonState == LOW && (now - lastPressTime[m]) > DEBOUNCE_MS) {
+    lastPressTime[m] = now;
+    pressed = true;
+  }
+  lastButtonState[m] = buttonState;
+  return pressed;
+}
+
+
+/* ============================================================================
+   IMPLEMENTACION: MODULO SENSOR (HC-SR04)
+   ============================================================================ */
+
+void sensorInit() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+}
+
+long readDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, SENSOR_TIMEOUT_US);
+  if (duration == 0) return -1;
+
+  return (long)(duration * 0.0343 / 2);
+}
+
+bool sensorUpdateAndIsPresent() {
+  unsigned long now = millis();
+  if (now - lastSensorRead >= SENSOR_READ_INTERVAL_MS) {
+    lastSensorRead = now;
+    long distance = readDistanceCM();
+    personPresentCached = (distance > 0 && distance <= DISTANCE_THRESHOLD_CM);
+  }
+  return personPresentCached;
+}
+
+
+/* ============================================================================
+   IMPLEMENTACION: MODULO BUZZER
+   ============================================================================ */
+
+void buzzerInit() {
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
+}
+
+// Dos tonos graves y cortos, tipo "buzz-buzz"
+void playFailSound() {
+  tone(BUZZER_PIN, 200, 150);
+  delay(200);
+  tone(BUZZER_PIN, 150, 250);
+  delay(250);
+  noTone(BUZZER_PIN);
+}
+
+// Melodia corta ascendente, tipo "jingle" de logro
+void playWinSound() {
+  int notas[]      = { 523, 659, 784, 1047 }; // Do5, Mi5, Sol5, Do6
+  int duraciones[] = { 120, 120, 120, 300 };
+
+  for (int i = 0; i < 4; i++) {
+    tone(BUZZER_PIN, notas[i], duraciones[i]);
+    delay(duraciones[i] + 30);
+  }
+  noTone(BUZZER_PIN);
+}
+
+
+/* ============================================================================
+   IMPLEMENTACION: MODULO MQTT
+   ============================================================================ */
+
+void setupWiFi() {
+  Serial.print("Conectando a WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("WiFi conectado. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("No se pudo conectar al WiFi (se seguira reintentando).");
+  }
+}
+
+// Puente interno: reenvia el mensaje al handler que registro el MODULO JUEGO
+void mqttInternalCallback(char* topic, byte* payload, unsigned int length) {
+  if (mqttExternalHandler != nullptr) {
+    mqttExternalHandler(topic, payload, length);
+  }
+}
+
+void reconnectMQTT() {
+  static unsigned long lastAttempt = 0;
+  unsigned long now = millis();
+
+  if (now - lastAttempt < 3000) return; // reintenta cada 3s, sin bloquear
+  lastAttempt = now;
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  Serial.print("Conectando a MQTT...");
+  if (mqttClient.connect(MQTT_CLIENT_ID)) {
+    Serial.println(" conectado.");
+    mqttClient.subscribe(TOPIC_CONTROL_SALA);
+  } else {
+    Serial.print(" fallo, rc=");
+    Serial.println(mqttClient.state());
+  }
+}
+
+void mqttModuleInit(MqttMessageHandler handler) {
+  mqttExternalHandler = handler;
+
+  setupWiFi();
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setCallback(mqttInternalCallback);
+}
+
+void mqttModuleLoop() {
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  mqttClient.loop();
+}
+
+bool mqttIsConnected() {
+  return mqttClient.connected();
+}
+
+void mqttPublish(const char* topic, const char* payload, bool retained) {
+  if (!mqttClient.connected()) return;
+  mqttClient.publish(topic, payload, retained);
+}
+
+
+/* ============================================================================
+   IMPLEMENTACION: MODULO JUEGO
+   ============================================================================ */
+
+void gameInit() {
+  ringsInit();
+  buttonsInit();
+  sensorInit();
+  buzzerInit();
+
+  for (int m = 0; m < NUM_MODULOS; m++) {
+    cursorIndex[m]  = 0;
+    lastStepTime[m] = 0;
+  }
+
+  snprintf(topicEstadoTablero, sizeof(topicEstadoTablero), "amongus/tablero%d/estado", NUMERO_TABLERO);
+  snprintf(topicTiempoTablero, sizeof(topicTiempoTablero), "amongus/tablero%d/tiempo", NUMERO_TABLERO);
+
+  mqttModuleInit(gameMqttCallback);
+
+  Serial.print("Tablero numero: ");
+  Serial.println(NUMERO_TABLERO);
+  Serial.println("Sistema listo. Esperando activacion por MQTT...");
+}
+
+void gameLoop() {
+  mqttModuleLoop();
+
+  bool nowPresent = sensorUpdateAndIsPresent();
+  updatePresence(nowPresent);
+
+  if (juego == JUEGO_JUGANDO) {
+    int m = activeModule;
+    unsigned long now = millis();
+
+    if (now - lastStepTime[m] >= ROTATE_DELAY_MS[m]) {
+      lastStepTime[m] = now;
+      cursorIndex[m] = (cursorIndex[m] + 1) % NUM_LEDS;
+      paintSpinningFrame(m, cursorIndex[m]);
+    }
+
+    if (buttonWasPressed(m)) {
+      Serial.print("Modulo ");
+      Serial.print(m + 1);
+      Serial.print(": boton presionado. cursor=");
+      Serial.print(cursorIndex[m]);
+      Serial.print(" target=");
+      Serial.println(TARGET_LED[m]);
+      handleButtonPress(m);
+    }
+  }
+}
+
+void updatePresence(bool nowPresent) {
+  if (waitingForLeave) {
+    if (!nowPresent) {
+      waitingForLeave = false;
+      juego = JUEGO_ESPERA;
+      resetAllModulesGame();
+      Serial.println("Persona alejada. Listo para una ronda nueva.");
+    }
+    return;
+  }
+
+  if (juego == JUEGO_ESPERA && nowPresent && estadoTablero == TABLERO_ACTIVO) {
+    Serial.println("Presencia detectada. Arranca el Modulo 1.");
+    activeModule = 0;
+    juego = JUEGO_JUGANDO;
+    startModule(activeModule);
+  }
+}
+
+void startModule(int m) {
+  cursorIndex[m]  = 0;
+  lastStepTime[m] = millis();
+  paintSpinningFrame(m, cursorIndex[m]);
+}
+
+void resetAllModulesGame() {
+  for (int m = 0; m < NUM_MODULOS; m++) {
+    cursorIndex[m] = 0;
+    paintStaticFrame(m);
+  }
+}
+
+void handleButtonPress(int m) {
+  if (cursorIndex[m] == TARGET_LED[m]) {
+    onSuccess(m);
+  } else {
+    onFail(m);
+  }
+}
+
+void onSuccess(int m) {
+  playWinSound();
+
+  for (int b = 0; b < 3; b++) {
+    paintSuccessBlinkStep(m, TARGET_LED[m], true);
+    delay(SUCCESS_BLINK_MS);
+    paintSuccessBlinkStep(m, TARGET_LED[m], false);
+    delay(SUCCESS_BLINK_MS);
+  }
+  paintSuccessBlinkStep(m, TARGET_LED[m], true);
+  delay(500);
+  paintStaticFrame(m);
+
+  Serial.print("Modulo ");
+  Serial.print(m + 1);
+  Serial.println(": ACIERTO.");
+
+  if (m == NUM_MODULOS - 1) {
+    // Se acertaron los 3 en orden: juego completo
+    juego = JUEGO_COMPLETO;
+    waitingForLeave = true;
+    Serial.println("JUEGO COMPLETO: los 3 modulos en orden correcto.");
+
+    celebrateAllModules();
+    playWinSound();
+    mqttPublish(MQTT_TOPIC_WIN, "{\"evento\":\"juego_ganado\"}", false);
+
+    estadoTablero = TABLERO_RESUELTO;
+    publicarEstadoTablero();
+
+    unsigned long segundos = (millis() - tiempoActivacionTablero) / 1000;
+    char bufferTiempo[12];
+    snprintf(bufferTiempo, sizeof(bufferTiempo), "%lu", segundos);
+    mqttPublish(topicTiempoTablero, bufferTiempo, true);
+    Serial.print("Tiempo publicado (seg): ");
+    Serial.println(bufferTiempo);
+
+    char siguienteTablero[2] = { (char)('0' + NUMERO_TABLERO + 1), '\0' };
+    mqttPublish(TOPIC_CONTROL_SALA, siguienteTablero, true);
+    Serial.print("Activando siguiente tablero: ");
+    Serial.println(siguienteTablero);
+  } else {
+    activeModule = m + 1;
+    Serial.print("Arranca el Modulo ");
+    Serial.println(activeModule + 1);
+    startModule(activeModule);
+  }
+}
+
+void onFail(int m) {
+  playFailSound();
+
+  for (int b = 0; b < 3; b++) {
+    paintFailBlinkStep(m, cursorIndex[m], true);
+    delay(FAIL_BLINK_MS);
+    paintFailBlinkStep(m, cursorIndex[m], false);
+    delay(FAIL_BLINK_MS);
+  }
+  paintStaticFrame(m);
+
+  Serial.print("Modulo ");
+  Serial.print(m + 1);
+  Serial.println(": FALLO. Se reinicia todo el juego.");
+
+  juego = JUEGO_ESPERA;
+  waitingForLeave = true;
+  resetAllModulesGame();
+}
+
+void publicarEstadoTablero() {
+  char msg[2] = { (char)estadoTablero, '\0' };
+  mqttPublish(topicEstadoTablero, msg, true);
+}
+
+void resetTableroCompleto() {
+  estadoTablero = TABLERO_ESPERA;
+  juego = JUEGO_ESPERA;
+  waitingForLeave = false;
+  resetAllModulesGame();
+  publicarEstadoTablero();
+  Serial.println("RESET GLOBAL recibido por MQTT. Tablero vuelve a ESPERA.");
+}
+
+void gameMqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (length == 0) return;
+  char comando = (char)payload[0];
+
+  if (strcmp(topic, TOPIC_CONTROL_SALA) == 0) {
+
+    if (comando == 'E' || comando == '0') {
+      resetTableroCompleto();
+      return;
+    }
+
+    uint8_t tableroAActivar = comando - '0';
+    if (tableroAActivar == NUMERO_TABLERO && estadoTablero == TABLERO_ESPERA) {
+      estadoTablero = TABLERO_ACTIVO;
+      tiempoActivacionTablero = millis();
+      Serial.print("Tablero ");
+      Serial.print(NUMERO_TABLERO);
+      Serial.println(" ACTIVADO por MQTT. Ya puede arrancar con el sensor.");
+      publicarEstadoTablero();
+    }
+  }
+}
